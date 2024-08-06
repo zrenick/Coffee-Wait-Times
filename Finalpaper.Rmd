@@ -1,0 +1,192 @@
+---
+title: "R Notebook"
+output: pdf_document
+---
+
+# Final Paper
+
+```{r}
+library(haven)
+library(tidyverse)
+coffee <- read_dta("coffee.dta")
+coffee <- na.omit(coffee) #drop missing observations with missing values
+coffee <- coffee %>% select(-contains("barista")) #drop the barista_"" columns because we don't know what they are and it could confuse the interpretation
+
+#convert columns to factors
+col_names <- names(coffee)
+factor_cols <- col_names[c(2,3,4,10,14,21)] #list of columns to factor
+coffee[factor_cols] <- lapply(coffee[factor_cols], factor) #factor all columns in the list
+
+#columns that are being factored
+names(Filter(is.factor, coffee))
+```
+Let's first fit an OLS model and use that for prediction of wait times
+```{r}
+#We could naively fit an OLS model on all of our data and then predict from that. 
+OLS <- glm(wait_secs ~ (.)^2, data = coffee[,-1])
+OLS_Pred = predict(OLS, newdata = coffee, type = 'response')
+
+#But how accurate is this model predicting? 
+#We can check this by doing a 90-10 sample split with our coffee data. 
+n <- nrow(coffee)
+set.seed(0)
+training_set_indices <- sample(1:n, size=round(n*0.9)) 
+training_set <- coffee[training_set_indices, ] 
+test_set <- coffee[-training_set_indices, ]
+OLS <- glm(wait_secs ~ (.)^2, data = training_set[,-1])
+
+OLS_dev <- function(sample_Ys, predictions) {
+  return(sum((sample_Ys - predictions)^2))
+}
+
+OLS_Pred <- predict(OLS, newdata=test_set, type = 'response')
+OLS_OOS_dev <- OLS_dev(log(test_set$wait_secs), OLS_Pred)
+null_pred <- mean(log(training_set$wait_secs))
+null_OOS_dev <- OLS_dev(log(test_set$wait_secs), null_pred)
+cat("The OOS R^2 is ", 1 - OLS_OOS_dev / null_OOS_dev,".", sep = "")
+
+```
+This is a really poor result, our OOS Deviance is extremely large in magnitude as well as negetive. This means our model is predicting way worse than even the null model with no coavariates would be. 
+
+To correct for this we can use some regularization penalties such as Lasso and Ridge to improve the selection and shrinkage of our coefficients in the hopes of improving the predicting power of our model.
+
+First we will run a 10 fold cross-validation estimator
+
+```{r}
+library(gamlr)
+library(glmnet)
+#create model matrix
+coffee <- naref(coffee)
+#include all variables from the dataset as well as the interactions between all of them
+X <- model.matrix(wait_secs ~ (.)^2, data = coffee)[,-1]
+
+#10 fold cv for Lasso Model
+set.seed(0)
+cv.coffee <- cv.gamlr(X, coffee$wait_secs)
+#optimal segment and lambda for Lasso 
+cat("The optimal lambda penalty for Lasso is", cv.coffee$lambda.min,"and the optimal segment is", cv.coffee$seg.min)
+
+#10 fold cv for Ridge Model
+cv.coffee.ridge <- cv.glmnet(X, coffee$wait_secs, alpha = 0)
+best_lambda_ridge = cv.coffee.ridge$lambda.min
+cat("The optimal lambda penalty for Ridge is", best_lambda_ridge , ".")
+```
+
+Plot the CV estimate
+
+```{r}
+png(file = "Plots.png")
+#Lasso
+par(mfrow = c(2,2))
+#plot the error-lambda graph
+plot(cv.coffee)
+#regularization path
+plot(cv.coffee$gamlr)
+
+#Ridge
+#plot the error-lambda graph
+plot(cv.coffee.ridge)
+#regularization path
+model <- glmnet(X, coffee$wait_secs, alpha = 0)
+plot(model, xvar = "lambda")
+dev.off()
+
+```
+
+Make a table of the chosen betas and their coefficients
+
+```{r}
+#create table of chosen betas from CV-Lasso
+cv.optimal.betas <- as.matrix(coef(cv.coffee, select = "min")) #store betas
+cv.optimal.betas <- data.frame(cv.optimal.betas) #to df
+#converts rownames to ind column
+cv.optimal.betas <- rownames_to_column(cv.optimal.betas, var = "Beta")
+#drop if coeffcient is = 0, remove intercept
+cv.optimal.betas <- subset(cv.optimal.betas, cv.optimal.betas[2] != 0)[-1,]
+colnames(cv.optimal.betas)[2] <- "Coefficient"
+#sort in decreasing order with largest magnitude coefs at the top
+cv.optimal.betas <- cv.optimal.betas[order(-cv.optimal.betas$Coefficient),]
+
+library(knitr)
+library(tidyverse)
+library(kableExtra)
+library(magrittr)
+
+#Printing out the Nonzero Coefficients
+colnames(cv.optimal.betas) <- c("Variable Name", "Coefficient")
+names = tibble::rownames_to_column(cv.optimal.betas)
+colnames(names) <- c("Name", "Variable Name", "Coefficient")
+kable(names[,-1], caption = "Nonzero variables")%>%
+  kable_styling() %>%
+  save_kable(file = "table_1.png")
+
+ 
+
+#create table of the best chosen betas from CV-Ridge
+best_model <- glmnet(X, coffee$wait_secs, alpha = 0, lambda = best_lambda_ridge)
+cv.optimal.betas <- as.matrix(coef(best_model, select = "min")) #store betas
+cv.optimal.betas <- data.frame(cv.optimal.betas) #to df
+#converts rownames to ind column
+cv.optimal.betas <- rownames_to_column(cv.optimal.betas, var = "Beta")
+#drop if coeffcient is = 0, remove intercept
+cv.optimal.betas <- subset(cv.optimal.betas, cv.optimal.betas[2] != 0)[-1,]
+colnames(cv.optimal.betas)[2] <- "Coefficient"
+#sort in decreasing order with largest magnitude coefs at the top
+cv.optimal.betas <- cv.optimal.betas[order(-cv.optimal.betas$Coefficient),]
+library(knitr)
+library(tidyverse)
+
+#Printing out the Shrunken Coefficients
+colnames(cv.optimal.betas) <- c("Variable Name", "Coefficient")
+names = tibble::rownames_to_column(cv.optimal.betas)
+colnames(names) <- c("Name", "Variable Name", "Coefficient")
+kable(names[1:14,-1], caption = "Shrunken variables", "html") %>%
+  kable_styling() %>%
+  save_kable(file = "table_2.png")
+
+
+```
+
+Make predictions
+
+```{r}
+#make predictions
+
+#For Lasso
+time_pred <- predict(cv.coffee, X, select = "min")
+time_pred <- as.data.frame(as.matrix(time_pred)) #convert preds to df
+colnames(time_pred)[1] <- "time_pred"
+
+#add the predicted wait time to the original dataset to see how the two compare
+library(dplyr)
+diff = data.frame(abs(coffee$wait_secs - time_pred$time_pred))
+compare <- cbind(coffee, time_pred, diff)
+compare <- compare %>% rename("Recorded Wait Time" = "wait_secs", "Predicted Wait Time" = "time_pred", "Absolute Difference" = "abs.coffee.wait_secs...time_pred.time_pred.", "Customer" = "customer")
+kable(compare[1:20,c(1,22,23,24)], caption = "Wait Times", "html") %>%
+  kable_styling() %>%
+  save_kable(file = "table_3.png")
+
+#OOS Deviance
+cat("The Out Of Sample R-squared using 10-fold cross validation for Lasso is", 1 - cv.coffee$cvm[cv.coffee$seg.min]/cv.coffee$cvm[1])
+
+
+#For Ridge
+time_pred <- predict(cv.coffee.ridge, X, select = "min")
+time_pred <- as.data.frame(as.matrix(time_pred)) #convert preds to df
+colnames(time_pred)[1] <- "time_pred"
+
+#add the predicted wait time to the original dataset to see how the two compare
+library(dplyr)
+diff = data.frame(abs(coffee$wait_secs - time_pred$time_pred))
+compare <- cbind(coffee, time_pred, diff)
+compare <- compare %>% rename("Recorded Wait Time" = "wait_secs", "Predicted Wait Time" = "time_pred", "Absolute Difference" = "abs.coffee.wait_secs...time_pred.time_pred.", "Customer" = "customer")
+kable(compare[1:20,c(1,22,23,24)], caption = "Wait Times", "html") %>%
+  kable_styling() %>%
+  save_kable(file = "table_4.png")
+
+#OOS Deviance
+cat("The Out Of Sample R-squared using 10-fold cross validation for Ridge is", 1 - min(cv.coffee.ridge$cvm)/cv.coffee.ridge$cvm[1])
+```
+
+
+\
